@@ -1,95 +1,214 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from aiokafka import AIOKafkaProducer
-from typing import List
-import asyncio
 import json
 import os
+import asyncio
+from datetime import datetime, timezone, timedelta
+from aiokafka import AIOKafkaProducer
+from typing import Any, Dict, List, Optional
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-# 데이터 규격 정의 (Pydantic)
-class TelemetryData(BaseModel):
-    car_id : str
-    seq: int
-    latitude : float
-    longitude: float
-    speed: float
-    accel: float
-    heading: float
-    timestamp: str
+KST = timezone(timedelta(hours=9))
 
-# Kafka 설정 (환경변수나 기본값 사용)
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_SERVERS", "localhost:9092")
-TOPIC_NAME = "car.telemetry.v1"
 
-# 글로벌 Producer 변수
-producer = None
+def _get_env(name: str, default: str) -> str:
+    return os.getenv(name, default).strip()
+
+
+def _as_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "on", "y"}
+
+
+APP_NAME = "Connected Car Ingest API"
+KAFKA_BROKERS = _get_env("KAFKA_BROKERS", "localhost:9092")
+KAFKA_TOPIC = _get_env("KAFKA_TOPIC", "car.telemetry.events")
+KAFKA_CLIENT_ID = _get_env("KAFKA_CLIENT_ID", "command-api-producer")
+KAFKA_ENABLED = _as_bool("KAFKA_ENABLED", True)
+ENABLE_SCHEMA_LOG = _as_bool("ENABLE_SCHEMA_LOG", False)
+
+app = FastAPI(title=APP_NAME)
+
+# 전역 비동기 카프카 프로듀서
+producer: Optional[AIOKafkaProducer] = None
 
 @app.on_event("startup")
 async def startup_event():
-    # 앱 시작 시 Kafka Producer를 초기화합니다.
     global producer
-    producer = AIOKafkaProducer(
-        bootstrap_servers = KAFKA_BOOTSTRAP_SERVERS,
+    if KAFKA_ENABLED:
+        try:
+            producer = AIOKafkaProducer(
+                bootstrap_servers = [s.strip() for s in KAFKA_BROKERS.split(",") if s.strip()],
+                value_serializer = lambda v : json.dumps(v).encode("utf-8"),
+                key_serializer = lambda v : v.encode("utf-8") if isinstance(v, str) else None,
+                acks = "all",
+                client_id = KAFKA_CLIENT_ID,
+            )
 
-        # 유실 방지를 위한 핵심 설정
-        acks = 'all',
-        enable_idempotence=True, # 중복 전송 방지
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
-    )
-
-    await producer.start()
-    print(f"🚀 Kafka Producer 시작됨 (Servers: {KAFKA_BOOTSTRAP_SERVERS})")
+            await producer.start() # 비동기로 연결 시작
+            print(f"[AIOKafkaProducer] started: brokers = {KAFKA_BROKERS}")
+        
+        except Exception as exc:
+            print(f"[AIOKafkaProducer] init failed : {exc}")
+            producer = None
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    # 앱 종료 시 Producer를 안전하게 닫습니다.
-    await producer.stop()
+    global producer
+    if producer:
+        await producer.stop()
+        print("[AIOKafkaProducer] stopped")
 
-# 1건씩 처리
-@app.post("/telemetry")
-async def receive_telemetry(data: TelemetryData):
-    # 더미 데이터로부터 차량 정보를 받아 Kafka로 전송합니다.
-    try:
-        # Kafka로 전송
-        # car_id를 key로 지정하면 특정 차량 데이터는 항상 같은 파티션에 쌓여 순서가 보장됨.
-        await producer.send_and_wait(
-            TOPIC_NAME,
-            value = data.dict(),
-            key = data.car_id.encode('utf-8')
+
+class VehicleInfo(BaseModel):
+    vehicle_id: str
+    vin: str
+    model: str
+    driver: str
+    timestamp: str
+
+
+class Coordinates(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class LocationInfo(BaseModel):
+    city: str
+    coordinates: Coordinates
+    heading_deg: float
+    altitude_m: float
+    gps_accuracy_m: float
+
+
+class TripInfo(BaseModel):
+    state: str
+    duration_s: int
+    duration_hms: str
+    speed_kmh: float
+    odometer_km: float
+    odometer_delta_km: float
+
+
+class BatteryInfo(BaseModel):
+    soc_pct: float
+    health_pct: float
+    pack_voltage_v: float
+    pack_current_a: float
+    aux_12v_battery_v: float
+    is_charging: bool
+
+
+class ConnectedCarData(BaseModel):
+    vehicle: VehicleInfo
+    location: LocationInfo
+    trip: TripInfo
+    battery: BatteryInfo
+    temperatures_c: Dict[str, float]
+    dynamics: Dict[str, Any]
+    status: Dict[str, Any]
+    diagnostics: Dict[str, Any]
+    events: List[str]
+
+
+def _build_kafka_message(payload: Dict[str, Any]) -> Dict[str, Any]:
+    vehicle = payload["vehicle"]
+    location = payload["location"]["coordinates"]
+    trip = payload["trip"]
+    battery = payload["battery"]
+    events = payload.get("events", [])
+
+    return {
+        "vehicle_id": vehicle["vehicle_id"],
+        "timestamp": vehicle["timestamp"],
+        "received_at": datetime.now(KST).isoformat(timespec="seconds"),
+        "state": trip.get("state"),
+        "speed_kmh": trip.get("speed_kmh"),
+        "soc_pct": battery.get("soc_pct"),
+        "location": {
+            "latitude": location.get("latitude"),
+            "longitude": location.get("longitude"),
+        },
+        "recent_event": events[-1] if events else None,
+        "raw": payload,
+    }
+
+@app.post("/api/telemetry/batch")
+async def ingest_telemetry_batch(data_list: List[ConnectedCarData]):
+    global producer
+
+    # 로컬 연습용 코드
+    return {"status": "success", "processed_count": len(data_list)}
+
+    if not KAFKA_ENABLED or producer is None:
+        raise HTTPException(
+            status_code = 503,
+            detail = "Kafka producer is not available. Check configuration."
         )
 
-        return {"status": "success", "car_id": data.car_id, "seq": data.seq}
-    
-    except Exception as e:
-        print(f"❌ Kafka 전송 에러: {e}")
-        raise HTTPException(status_code = 500, detail = "Internal Server Error")
+    tasks = []
 
-# 여러 건 한 방에 처리 (batch) 
-@app.post("/telemetry/batch")
-async def receive_telemetry_batch(data_list: List[TelemetryData]):
-    try:
-        tasks = []
-        # 받은 데이터 리스트를 루프 돌며 카프카 전송 예약
-        for data in data_list:
-            tasks.append(
-                producer.send_and_wait(
-                    TOPIC_NAME,
-                    value = data.dict()
-                    key = data.car_id.encode('utf-8')
-                )
+    # 데이터를 루프 돌며 전송 예약을 걸어둠.
+    for data in data_list:
+        payload = data.model_dump()
+        kafka_payload = _build_kafka_message(payload)
+
+        # 비동기 send_and_wait() 방식 사용
+        tasks.append(
+            producer.send_and_wait(
+                KAFKA_TOPIC,
+                key = payload["vehicle"]["vehicle_id"],
+                value = kafka_payload
             )
+        )
 
-        # 예약된 카프카 전송을 동시에 병렬로
+    try:
+        # 예약된 전송 작업을 병렬로 쏴버림
         await asyncio.gather(*tasks)
+        return {"status": "success", "processed_count": len(data_list)}
+    
+    except Exception as exc:
+        print(f"[ingest/batch] send failed: {exc}")
+        raise HTTPException(status_code = 500, detail = "Failed to publish telemetry event batch.")
 
-        return {"status": "success", "inserted": len(data_list)}
+@app.post("/api/telemetry")
+async def ingest_telemetry_single(data: ConnectedCarData):
+    global producer
+
+    # 로컬 연습용 코드
+    return {"status": "success", "processed_vehicle": data.vehicle.vehicle_id}
+
+    if not KAFKA_ENABLED or producer is None:
+        raise HTTPException(
+            status_code = 503,
+            detail = "Kafka producer is not available. Check configuration."
+        )
+
+    payload = data.model_dump()
+    if ENABLE_SCHEMA_LOG:
+        print("[ingest] payload:", json.dumps(payload, ensure_ascii=False)[:500])
+
+    kafka_payload = _build_kafka_message(payload)
+
+    try:
+        await producer.send_and_wait(
+            KAFKA_TOPIC,
+            key = payload["vehicle"]["vehicle_id"],
+            value = kafka_payload,
+        )
+
+        return {"status": "success", "processed_vehicle": payload["vehicle"]["vehicle_id"]}
     
-    except Exception as e:
-        print(f"❌ Kafka Batch 전송 에러: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-    
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    except Exception as exc:
+        print(f"[ingest/single] send failed: {exc}")
+        raise HTTPException(status_code = 500, detail = "Failed to publish telemetry event.")
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "service": APP_NAME,
+        "kafka_enabled": KAFKA_ENABLED,
+        "kafka_topic": KAFKA_TOPIC,
+        "kafka_brokers": KAFKA_BROKERS,
+    }
