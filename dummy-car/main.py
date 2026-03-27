@@ -8,7 +8,7 @@ import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from math import asin, cos, radians, sin, sqrt
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -19,7 +19,6 @@ from pydantic import BaseModel, Field
 # 서울 위도/경도 최소/최대
 SEOUL_BOUNDS = (37.40, 37.70, 126.76, 127.20)
 SEOUL_ANCHOR = ("Seoul", 37.5665, 126.9780, 55.0)
-KST = timezone(timedelta(hours=9))
 
 app = FastAPI(
     title="Connected Car Dummy Stream Server",
@@ -144,8 +143,8 @@ def _normalize_seed_point(city_name: str, lat: float, lon: float) -> Tuple[str, 
     return anchor_name, anchor_lat + d_lat, anchor_lon + d_lon
 
 
-def kst_now_iso() -> str:
-    return datetime.now(KST).isoformat(timespec="seconds")
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 @dataclass
@@ -169,7 +168,7 @@ class VehicleState:
     tire_pressure_psi: Dict[str, float]
     heading_deg: float
     ambient_temp_c: float
-    last_updated: datetime = field(default_factory=lambda: datetime.now(KST))
+    last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     throttle_pct: float = 0.0
     brake_pct: float = 0.0
     steering_deg: float = 0.0
@@ -372,7 +371,7 @@ def update_telemetry(vehicle: VehicleState, dt: float) -> List[str]:
 
 
 def build_payload(vehicle: VehicleState, events: List[str]) -> Dict[str, Any]:
-    ts = kst_now_iso()
+    ts = utc_now_iso()
     
     duration_s = random.randint(0, 7200)
     m, s = divmod(duration_s, 60)
@@ -474,7 +473,7 @@ async def stream_vehicle(vehicle_id: str) -> None:
             interval = random.uniform(INGEST_INTERVAL_MIN, INGEST_INTERVAL_MAX)
             await asyncio.sleep(interval)
 
-            now = datetime.now(KST)
+            now = datetime.now(timezone.utc)
             dt = (now - vehicle.last_updated).total_seconds()
             dt = max(1.0, min(3.5, dt))
             vehicle.last_updated = now
@@ -620,7 +619,7 @@ def status():
         "buffered_messages_per_vehicle": {
             vehicle_id: len(msgs) for vehicle_id, msgs in history_store.items()
         },
-        "now": kst_now_iso(),
+        "now": utc_now_iso(),
     }
 
 

@@ -1,7 +1,7 @@
 import json
 import os
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from aiokafka import AIOKafkaProducer
 from typing import Any, Dict, List, Optional
 
@@ -12,9 +12,6 @@ import logging
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-KST = timezone(timedelta(hours=9))
-
 
 def _get_env(name: str, default: str) -> str:
     return os.getenv(name, default).strip()
@@ -131,7 +128,7 @@ def _build_kafka_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "vehicle_id": vehicle["vehicle_id"],
         "timestamp": vehicle["timestamp"],
-        "received_at": datetime.now(KST).isoformat(timespec="seconds"),
+        "received_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "state": trip.get("state"),
         "speed_kmh": trip.get("speed_kmh"),
         "soc_pct": battery.get("soc_pct"),
