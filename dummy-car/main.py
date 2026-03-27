@@ -5,6 +5,7 @@ import json
 import random
 import httpx  # 외부 API(카프카 수신 서버)로 POST 요청을 보내기 위해 추가됨
 import os
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -39,27 +40,26 @@ app.add_middleware(
 PROJECT_ROOT = Path(__file__).resolve().parent
 DUMMY_DATA_PATH = PROJECT_ROOT / "car_profiles.json"
 
-EXTERNAL_SINGLE_URL = os.getenv(
-    "INGEST_SERVER_SINGLE_URL",
-    "http://127.0.0.1:8000/api/telemetry",
-)
-
 EXTERNAL_BATCH_URL = os.getenv(
     "INGEST_SERVER_URL",
     "http://127.0.0.1:8000/api/telemetry/batch",
 )
+
 MAX_SPEED_KMH = 100.0
 MAX_ACCEL_KMH_PER_SEC = 8.0
 MAX_DECEL_KMH_PER_SEC = 25.0
-INGEST_INTERVAL_MIN = float(os.getenv("INGEST_INTERVAL_MIN", "1.0"))#다음 전송까지의 최소 대기시간
-INGEST_INTERVAL_MAX = float(os.getenv("INGEST_INTERVAL_MAX", "2.0"))#다음 전송까지의 최대 대기시간
-INGEST_REQUEST_TIMEOUT = float(os.getenv("INGEST_REQUEST_TIMEOUT", "5.0"))# 전송 실패동안 기다리는 timeout
+INGEST_INTERVAL_MIN = float(os.getenv("INGEST_INTERVAL_MIN", "5.0"))#다음 전송까지의 최소 대기시간
+INGEST_INTERVAL_MAX = float(os.getenv("INGEST_INTERVAL_MAX", "10.0"))#다음 전송까지의 최대 대기시간
+INGEST_REQUEST_TIMEOUT = float(os.getenv("INGEST_REQUEST_TIMEOUT", "10.0"))# 전송 실패동안 기다리는 timeout
 MAX_SEED_JITTER_DEG = 0.002  # 약 200m 정도(위치별 차이가 큼)
 try:
     DUMMY_SEED_COUNT = max(1, int(os.getenv("DUMMY_SEED_COUNT", "10")))
 except ValueError:
     DUMMY_SEED_COUNT = 1000
 EARTH_RADIUS_KM = 6371.0088
+
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2.0 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     lat1_rad = radians(lat1)
@@ -229,6 +229,10 @@ class VehicleState:
 
     # 로컬 버퍼 추가
     tx_buffer: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+
+    # 재시도 관련 로직 추가
+    retry_count: int = 0 # 연속 실패 횟수
+    last_retry_time: Optional[float] = None # 마지막 재시도 시각
 
 class VehicleEnvelope(BaseModel):
     vehicle_id: str = Field(..., example="CAR-1001")
@@ -597,44 +601,74 @@ async def stream_vehicle(vehicle_id: str) -> None:
                 f"{payload['trip']['speed_kmh']:>5} km/h | SOC {payload['battery']['soc_pct']:.1f}%"
             )
 
-            # 데이터가 생성되면 일단 버퍼에 넣음
+            # 새 데이터를 버퍼에 추가
             vehicle.tx_buffer.append(payload)
 
-            # 버퍼에 담긴 데이터를 리스트로 묶음
-            bulk_data = list(vehicle.tx_buffer)
-            buffer_size = len(bulk_data)
+            # 버퍼 전송 로직 (재시도 로직 추가)
+            if vehicle.last_retry_time:
+                backoff_delay = RETRY_BACKOFF_BASE ** min(vehicle.retry_count, 5)
+                elapsed = time.time() - vehicle.last_retry_time
+
+                if elapsed < backoff_delay:
+                    print(f"{vehicle_id} 재시도 대기중... ({elapsed:.1f}/{backoff_delay:.1f}초)")
+                    continue
+
+            buffer_size = len(vehicle.tx_buffer)
+            if buffer_size == 0:
+                continue
+
+            # 배치 크기 제한 (한 번에 너무 많이 보내지 않기)
+            batch_size = min(buffer_size, 50) # 최대 50개씩만 전송
+            bulk_data = list(vehicle.tx_buffer)[:batch_size]
 
             try:
-                # 분기 데이터 로직
-                if buffer_size == 1:
-                    # 하나만 전송
-                    response = await client.post(
-                        EXTERNAL_SINGLE_URL,
-                        json = bulk_data[0],
-                        timeout = INGEST_REQUEST_TIMEOUT
-                    )
-                
-                else:
-                    # 여러 개 전송
-                    response = await client.post(
-                        EXTERNAL_BATCH_URL,
-                        json = bulk_data,
-                        timeout = INGEST_REQUEST_TIMEOUT
-                    )
-                
+                # 배치 엔드포인트로 통일
+                response = await client.post(
+                    EXTERNAL_BATCH_URL,
+                    json = bulk_data,
+                    timeout = INGEST_REQUEST_TIMEOUT
+                )
+
                 if response.status_code == 200:
-                    for _ in range(buffer_size):
+                    # 성공했다면 전송한 만큼 버퍼에서 제거
+                    for _ in range(batch_size):
                         vehicle.tx_buffer.popleft()
 
-                    if buffer_size > 1:
-                        print(f"{vehicle_id} 밀린 데이터 {buffer_size}개 한 방에 전송 완료!")
+                    # 재시도 카운터 리셋
+                    vehicle.retry_count = 0
+                    vehicle.last_retry_time = None
+
+                    if batch_size > 1:
+                        print(f"{vehicle_id} 밀린 데이터 {batch_size}개 전송 완료! (남은 버퍼: {len(vehicle.tx_buffer)})")
 
                 else:
-                    print(f"[API Error] {vehicle_id} Status {response.status_code} - 밀린 데이터: {buffer_size}개")   
+                    # HTTP 에러 시 (4xx, 5xx)
+                    vehicle.retry_cout += 1
+                    vehicle.last_retry_time = time.time()
+                    print(f"{vehicle_id} HTTP {response.status_code} - 재시도 {vehicle.retry_count}/{MAX_RETRIES} (버퍼: {buffer_size}개)")
 
+                    # 최대 재시도 초과 시 오래된 데이터 일부 버림
+                    if vehicle.retry_cout <= MAX_RETRIES and buffer_size > 800:
+                        drop_count = 100
+                        for _ in range(drop_count):
+                            vehicle.tx_buffer.popleft()
+                        print(f"{vehicle_id} 버퍼 포화 - 오래된 데이터 {drop_count}개 삭제")
+                        vehicle.retry_count = 0 # 리셋해서 다시 시도
+
+            except httpx.TimeoutException:
+                vehicle.retry_count += 1
+                vehicle.last_retry_time = time.time()
+                print(f"{vehicle_id} 타임아웃 - 재시도 {vehicle.retry_count}/{MAX_RETRIES} (버퍼: {buffer_size}개)")
+
+            except httpx.NetworkError as e:
+                vehicle.retry_count += 1
+                vehicle.last_retry_time = time.time()
+                print(f"{vehicle_id} 네트워크 에러 - 재시도 {vehicle.retry_count}/{MAX_RETRIES} (버퍼: {buffer_size}개)")
+            
             except Exception as e:
-                print(f"[Network Error] {vehicle_id} 전송 실패: {type(e).__name__} - 버퍼 대기열 {buffer_size}개")
-
+                vehicle.retry_count += 1
+                vehicle.last_retry_time = time.time()
+                print(f"{vehicle_id} 예외 발생: {type(e).__name__} - {str(e)[:100]}")
 
 def get_envelope(vehicle_id: str) -> Optional[Dict[str, Any]]:
     history = history_store.get(vehicle_id)
