@@ -468,53 +468,59 @@ vehicle_states: Dict[str, VehicleState] = {v.vehicle_id: v for v in generate_veh
 history_store: Dict[str, Deque[Dict[str, Any]]] = defaultdict(lambda: deque(maxlen=120))
 producer_tasks: List[asyncio.Task[Any]] = []
 
+async def generate_telemetry(vehicle_id: str) -> None:
+    # 데이터 생성 전용 - 항상 5~10초 주기
+    vehicle = vehicle_states[vehicle_id]
+    
+    while True:
+        await asyncio.sleep(random.uniform(INGEST_INTERVAL_MIN, INGEST_INTERVAL_MAX))
+        
+        now = datetime.now(timezone.utc)
+        dt = (now - vehicle.last_updated).total_seconds()
+        dt = max(1.0, min(3.5, dt))
+        vehicle.last_updated = now
 
-async def stream_vehicle(vehicle_id: str) -> None:
+        simulate_trip_state(vehicle, dt)
+        events = update_telemetry(vehicle, dt)
+        payload = build_payload(vehicle, events)
+
+        history_store[vehicle_id].append(payload)
+        vehicle.tx_buffer.append(payload)
+
+        print(
+            f"[{payload['vehicle']['timestamp']}] 🚗 {vehicle_id} | {vehicle.trip_state:<5} | "
+            f"{payload['trip']['speed_kmh']:>5} km/h | SOC {payload['battery']['soc_pct']:.1f}% | 📦 버퍼: {len(vehicle.tx_buffer)}개"
+        )
+
+
+async def transmit_telemetry(vehicle_id: str) -> None:
+    # 전송 전용 - 백오프 적용
     vehicle = vehicle_states[vehicle_id]
 
     async with httpx.AsyncClient() as client:
         while True:
-            if vehicle.last_retry_time: # 연결 실패시
+            # 버퍼 빌 때까지 잠깐 대기
+            if len(vehicle.tx_buffer) == 0:
+                await asyncio.sleep(2.0)
+                continue
+
+            # 백오프 쿨타임 체크
+            if vehicle.last_retry_time:
                 backoff_delay = (
                     MAX_BACKOFF_DELAY
                     if vehicle.retry_count >= MAX_RETRIES
                     else RETRY_BACKOFF_BASE ** vehicle.retry_count
                 )
-
                 elapsed = time.time() - vehicle.last_retry_time
-                sleep_time = max(0.0, backoff_delay - elapsed)
-            
-            else: 
-                sleep_time = random.uniform(INGEST_INTERVAL_MIN, INGEST_INTERVAL_MAX)
+                remaining = backoff_delay - elapsed
 
-            await asyncio.sleep(sleep_time)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)  # 쿨타임만큼 정확히 대기
 
-            now = datetime.now(timezone.utc)
-            dt = (now - vehicle.last_updated).total_seconds()
-            dt = max(1.0, min(3.5, dt))
-            vehicle.last_updated = now
-
-            simulate_trip_state(vehicle, dt)
-            events = update_telemetry(vehicle, dt)
-            payload = build_payload(vehicle, events)
-
-            history_store[vehicle_id].append(payload)
-
-            vehicle.tx_buffer.append(payload)
-
-            print(
-                f"[{payload['vehicle']['timestamp']}] 🚗 {vehicle_id} | {vehicle.trip_state:<5} | "
-                f"{payload['trip']['speed_kmh']:>5} km/h | SOC {payload['battery']['soc_pct']:.1f}% | 📦 버퍼: {len(vehicle.tx_buffer)}개"
-            )
-
-            buffer_size = len(vehicle.tx_buffer)
-            if buffer_size == 0:
-                continue
-
-            batch_size = min(buffer_size, 50)
+            # 전송 시도
+            batch_size = min(len(vehicle.tx_buffer), 50)
             bulk_data = list(vehicle.tx_buffer)[:batch_size]
-
-            error_msg = None # 에러 상태를 추적할 변수
+            error_msg = None
 
             try:
                 response = await client.post(
@@ -524,15 +530,12 @@ async def stream_vehicle(vehicle_id: str) -> None:
                 )
 
                 if response.status_code == 200:
-                    # 성공 시: 버퍼 정리 및 카운터 리셋
                     for _ in range(batch_size):
                         vehicle.tx_buffer.popleft()
-
                     vehicle.retry_count = 0
                     vehicle.last_retry_time = None
 
                 else:
-                    # HTTP 에러
                     error_msg = f"HTTP {response.status_code}"
 
             except httpx.TimeoutException:
@@ -547,8 +550,7 @@ async def stream_vehicle(vehicle_id: str) -> None:
                 vehicle.last_retry_time = time.time()
 
                 if vehicle.retry_count == MAX_RETRIES:
-                    print(f"💤 {vehicle_id} 최대 재시도({MAX_RETRIES}회) 도달: 지금부터는 서버 부하 방지를 위해 {int(MAX_BACKOFF_DELAY)}초 주기로 연결을 시도합니다.")
-                # 어떤 에러가 나든 버퍼가 포화 상태면 오래된 데이터를 버림
+                    print(f"💤 {vehicle_id} 최대 재시도({MAX_RETRIES}회) 도달: {int(MAX_BACKOFF_DELAY)}초 주기로 연결을 시도합니다.")
 
                 print(f"❌ 🚗 {vehicle_id} {error_msg} - 접속 연결 연속 실패 {vehicle.retry_count}회")
 
@@ -624,14 +626,12 @@ def status():
         "now": utc_now_iso(),
     }
 
-
 @app.on_event("startup")
 async def startup_event() -> None:
     print("Connected Car Dummy Stream starting...")
     for vehicle_id in vehicle_states:
-        task = asyncio.create_task(stream_vehicle(vehicle_id))
-        producer_tasks.append(task)
-
+        producer_tasks.append(asyncio.create_task(generate_telemetry(vehicle_id)))
+        producer_tasks.append(asyncio.create_task(transmit_telemetry(vehicle_id)))
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
