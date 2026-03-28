@@ -175,6 +175,7 @@ class VehicleState:
     coolant_temp_c: float = field(default_factory=lambda: random.uniform(70.0, 92.0))
     is_charging: bool = False
     last_move_km: float = 0.0
+    trip_start_time : Optional[datetime] = None
     tx_buffer: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     retry_count: int = 0
     last_retry_time: Optional[float] = None
@@ -281,6 +282,7 @@ def simulate_trip_state(vehicle: VehicleState, dt: float) -> None:
             vehicle.is_locked = False
             vehicle.ignition_on = True
             vehicle.speed_kmh = max(vehicle.speed_kmh, 20.0)
+            vehicle.trip_start_time = datetime.now(timezone.utc)
         elif p < 0.09:
             vehicle.trip_state = "PARK"
             vehicle.is_locked = True
@@ -299,6 +301,7 @@ def simulate_trip_state(vehicle: VehicleState, dt: float) -> None:
             vehicle.trip_state = "IDLE"
             vehicle.ignition_on = False
             vehicle.throttle_pct = 0.0
+            vehicle.trip_start_time = None
         elif p < 0.06:
             vehicle.speed_kmh = 0.0
 
@@ -372,8 +375,11 @@ def update_telemetry(vehicle: VehicleState, dt: float) -> List[str]:
 
 def build_payload(vehicle: VehicleState, events: List[str]) -> Dict[str, Any]:
     ts = utc_now_iso()
-    
-    duration_s = random.randint(0, 7200)
+
+    if vehicle.trip_start_time and vehicle.trip_state == "DRIVE":
+        duration_s = int((datetime.now(timezone.utc) - vehicle.trip_start_time).total_seconds())
+    else:
+        duration_s = 0
     m, s = divmod(duration_s, 60)
     h, m = divmod(m, 60)
     duration_hms = f"{h:02d}:{m:02d}:{s:02d}"
@@ -386,8 +392,6 @@ def build_payload(vehicle: VehicleState, events: List[str]) -> Dict[str, Any]:
             "driver": vehicle.driver,
             "timestamp": ts
         },
-        "model": vehicle.model,
-        "driver": vehicle.driver,
         "location": {
             "city": vehicle.city,
             "coordinates": {
@@ -470,8 +474,20 @@ async def stream_vehicle(vehicle_id: str) -> None:
 
     async with httpx.AsyncClient() as client:
         while True:
-            interval = random.uniform(INGEST_INTERVAL_MIN, INGEST_INTERVAL_MAX)
-            await asyncio.sleep(interval)
+            if vehicle.last_retry_time: # 연결 실패시
+                backoff_delay = (
+                    MAX_BACKOFF_DELAY
+                    if vehicle.retry_count >= MAX_RETRIES
+                    else RETRY_BACKOFF_BASE ** vehicle.retry_count
+                )
+
+                elapsed = time.time() - vehicle.last_retry_time
+                sleep_time = max(0.0, backoff_delay - elapsed)
+            
+            else: 
+                sleep_time = random.uniform(INGEST_INTERVAL_MIN, INGEST_INTERVAL_MAX)
+
+            await asyncio.sleep(sleep_time)
 
             now = datetime.now(timezone.utc)
             dt = (now - vehicle.last_updated).total_seconds()
@@ -490,20 +506,6 @@ async def stream_vehicle(vehicle_id: str) -> None:
                 f"[{payload['vehicle']['timestamp']}] 🚗 {vehicle_id} | {vehicle.trip_state:<5} | "
                 f"{payload['trip']['speed_kmh']:>5} km/h | SOC {payload['battery']['soc_pct']:.1f}% | 📦 버퍼: {len(vehicle.tx_buffer)}개"
             )
-
-            # 재시도 백오프 체크
-            if vehicle.last_retry_time:
-
-                # 3회 이상 실패 시 무조건 15초, 그 전에는 지수 백오프 방식으로 접속 시도
-                if vehicle.retry_count >= MAX_RETRIES:
-                    backoff_delay = MAX_BACKOFF_DELAY # 15초
-                else:
-                    backoff_delay = RETRY_BACKOFF_BASE ** vehicle.retry_count  # 2초, 4초, 8초...
-
-                elapsed = time.time() - vehicle.last_retry_time
-
-                if elapsed < backoff_delay:
-                    continue
 
             buffer_size = len(vehicle.tx_buffer)
             if buffer_size == 0:

@@ -73,6 +73,27 @@ class VehicleInfo(BaseModel):
     driver: str
     timestamp: str
 
+class DynamicsInfo(BaseModel):
+    traction: str
+    acceleration_mps2: float
+    brake_pct: float
+    throttle_pct: float
+    steering_deg: float
+    gear: str
+    driving_mode: str
+
+class StatusInfo(BaseModel):
+    is_locked: bool
+    ignition_on: bool
+    park_brake: bool
+    door_locked: Dict[str, bool]
+    window_position: Dict[str, str]
+
+class DiagnosticsInfo(BaseModel):
+    warnings: Dict[str, bool]
+    tire_pressure_psi: Dict[str, float]
+    firmware_ver: str
+    sensor_health: str
 
 class Coordinates(BaseModel):
     latitude: float
@@ -111,9 +132,9 @@ class ConnectedCarData(BaseModel):
     trip: TripInfo
     battery: BatteryInfo
     temperatures_c: Dict[str, float]
-    dynamics: Dict[str, Any]
-    status: Dict[str, Any]
-    diagnostics: Dict[str, Any]
+    dynamics: DynamicsInfo
+    status: StatusInfo
+    diagnostics: DiagnosticsInfo
     events: List[str]
 
 
@@ -166,18 +187,22 @@ async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> int:
             )
         )
 
-    try:
-        await asyncio.gather(*tasks)
-        logger.info(f"Sent {len(data_list)} messages to Kafka Topic '{KAFKA_TOPIC}'")
-        return len(data_list)
-    
-    except Exception as exc:
-        logger.error(f"(X) Kafka send failed: {exc}")
-        raise HTTPException(
-            status_code = 500,
-            detail = f"Failed to publish telemetry events to Kafka: {str(exc)}"
-        )
-    
+    results = await asyncio.gather(*tasks, return_exceptions = True)
+
+    failed = [(data_list[idx], error) for idx, error in enumerate(results) if isinstance(error, Exception)]
+    success_count = len(data_list) - len(failed)
+
+    if failed:
+        for data, exc in failed:
+            vehicle_id = data.get("vehicle", {}).get("vehicle_id", "unknown")
+            logger.error(f"Kafka 전송 실패 vehicle_id = {vehicle_id}: {exc}")
+
+    if success_count == 0:
+        raise HTTPException(status_code = 500, detail = "모든 메시지 Kafka 전송 실패")
+
+    logger.info(f"Kafka 전송 완료: 성공 {success_count}건 / 실패 {len(failed)}건") 
+    return success_count
+
 @app.post("/api/telemetry/batch")
 async def ingest_telemetry_batch(data_list: List[ConnectedCarData]):
     # 배치 텔레메트리 수신 (단일 데이터도 리스트로 받음)
@@ -195,8 +220,9 @@ async def ingest_telemetry_batch(data_list: List[ConnectedCarData]):
     vehicle_ids = [p["vehicle"]["vehicle_id"] for p in payloads]
 
     return {
-        "status": "success",
+        "status": "success" if processed_count == len(data_list) else "partial",
         "processed_count": processed_count,
+        "failed_count" : len(data_list) - processed_count,
         "vehicle_ids": vehicle_ids[:10] if len(vehicle_ids) > 10 else vehicle_ids,
         "kafka_enabled": KAFKA_ENABLED,
     }
