@@ -174,14 +174,15 @@ async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> int:
         return len(data_list)
 
     # Kafka 전송
-    tasks = []
+    tagged_tasks = []
     for data in data_list:
         kafka_payload = _build_kafka_message(data)
+        vehicle_id = kafka_payload["vehicle_id"]
 
         if ENABLE_SCHEMA_LOG:
             logger.debug(f"Sending to Kafka: {kafka_payload['vehicle_id']} @ {kafka_payload['timestamp']}")
 
-        tasks.append(
+        tagged_tasks.append(
             producer.send_and_wait(
                 KAFKA_TOPIC,
                 key = kafka_payload["vehicle_id"],
@@ -189,17 +190,19 @@ async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> int:
             )
         )
 
-    results = await asyncio.gather(*tasks, return_exceptions = True)
+    vehicle_ids, coros = zip(**tagged_tasks)
+    results = await asyncio.gather(*coros, return_exceptions = True)
 
-    failed = [(data_list[idx], error) for idx, error in enumerate(results) if isinstance(error, Exception)]
-    success_count = len(data_list) - len(failed)
+    failed = []
+    success_count = 0
+    for vehicle_id, result in zip(vehicle_ids, results):
+        if isinstance(result, Exception):
+            failed.append((vehicle_id, result))
+            logger.error(f"Kafka 전송 실패 vehicle_id={vehicle_id}: {result}")
+        else:
+            success_count += 1
 
-    if failed:
-        for data, exc in failed:
-            vehicle_id = data.get("vehicle", {}).get("vehicle_id", "unknown")
-            logger.error(f"Kafka 전송 실패 vehicle_id = {vehicle_id}: {exc}")
-
-    if success_count == 0:
+    if success_count == 0 and len(data_list) > 0:
         raise HTTPException(status_code = 500, detail = "모든 메시지 Kafka 전송 실패")
 
     logger.info(f"Kafka 전송 완료: 성공 {success_count}건 / 실패 {len(failed)}건") 
@@ -241,7 +244,7 @@ async def ingest_telemetry_single(data: ConnectedCarData, response: Response):
     result = await ingest_telemetry_batch([data], response)
 
     return {
-        "status" : "success",
+        "status" : result["status"],
         "processed_vehicle" : data.vehicle.vehicle_id,
         "kafka_enabled": KAFKA_ENABLED,
     }

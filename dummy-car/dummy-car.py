@@ -133,20 +133,6 @@ def haversine_step(distance_km: float, heading_deg: float, lat: float) -> Tuple[
     d_lon = (distance_m * sin(radians(heading_deg))) / (111_000.0 * max(0.2, cos(radians(lat))))
     return d_lat, d_lon
 
-
-def _pick_city_route() -> Tuple[str, float, float]:
-    """서울 중심에서 랜덤 위치 선택"""
-    city_name, anchor_lat, anchor_lon, radius_km = SEOUL_ANCHOR
-    for _ in range(20):
-        heading = random.uniform(0, 360)
-        distance = random.uniform(0.5, min(radius_km * 0.4, 20.0))
-        d_lat, d_lon = haversine_step(distance, heading, anchor_lat)
-        lat, lon = anchor_lat + d_lat, anchor_lon + d_lon
-        if _inside_seoul(lat, lon):
-            return city_name, lat, lon
-    return city_name, anchor_lat, anchor_lon
-
-
 def _normalize_seed_point(city_name: str, lat: float, lon: float) -> Tuple[str, float, float]:
     """시드 포인트에 약간의 지터 추가"""
     for _ in range(15):
@@ -298,6 +284,7 @@ def simulate_trip_state(vehicle: VehicleState, dt: float) -> None:
             vehicle.trip_state = "DRIVE"
             vehicle.is_locked = False
             vehicle.ignition_on = True
+            vehicle.is_charging = False
             vehicle.speed_kmh = max(vehicle.speed_kmh, 20.0)
             vehicle.trip_start_time = datetime.now(timezone.utc)
         elif p < 0.09:
@@ -416,7 +403,7 @@ def build_payload(vehicle: VehicleState, events: List[str]) -> Dict[str, Any]:
                 "longitude": round(vehicle.longitude, 6)
             },
             "heading_deg": round(vehicle.heading_deg, 2),
-            "altitude_m": round(8 + (vehicle.vehicle_id[-1].__hash__() % 40), 2),
+            "altitude_m": round(8 + (ord(vehicle.vehicle_id[-1]) % 40), 2),
             "gps_accuracy_m": round(random.uniform(1.0, 8.0), 2)
         },
         "trip": {
