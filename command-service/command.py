@@ -163,7 +163,7 @@ def _build_kafka_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "raw": payload,
     }
 
-async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> int:
+async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> tuple[int, List[str]]:
     # Kafka로 데이터 전송
     if not KAFKA_ENABLED or producer is None: # 카프카가 죽거나 producer가 없을 때
         # 로컬 모드: 로그만 출력하고 성공 처리
@@ -171,7 +171,7 @@ async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> int:
 
         if ENABLE_SCHEMA_LOG and data_list:
             logger.debug(f"Sample payload: {json.dumps(data_list[0], ensure_ascii=False)[:300]}")
-        return len(data_list)
+        return len(data_list), []
 
     # Kafka 전송
     tagged_tasks = []
@@ -182,15 +182,17 @@ async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> int:
         if ENABLE_SCHEMA_LOG:
             logger.debug(f"Sending to Kafka: {kafka_payload['vehicle_id']} @ {kafka_payload['timestamp']}")
 
-        tagged_tasks.append(
+        tagged_tasks.append((
+            vehicle_id,
+        
             producer.send_and_wait(
                 KAFKA_TOPIC,
                 key = kafka_payload["vehicle_id"],
                 value = kafka_payload
             )
-        )
+        ))
 
-    vehicle_ids, coros = zip(**tagged_tasks)
+    vehicle_ids, coros = zip(*tagged_tasks)
     results = await asyncio.gather(*coros, return_exceptions = True)
 
     failed = []
@@ -205,8 +207,9 @@ async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> int:
     if success_count == 0 and len(data_list) > 0:
         raise HTTPException(status_code = 500, detail = "모든 메시지 Kafka 전송 실패")
 
+    failed_ids = [vid for vid, _ in failed]
     logger.info(f"Kafka 전송 완료: 성공 {success_count}건 / 실패 {len(failed)}건") 
-    return success_count
+    return success_count, failed_ids
 
 @app.post("/api/telemetry/batch")
 async def ingest_telemetry_batch(data_list: List[ConnectedCarData], response: Response):
@@ -219,7 +222,7 @@ async def ingest_telemetry_batch(data_list: List[ConnectedCarData], response: Re
     payloads = [data.model_dump() for data in data_list]
 
     # Kafka로 전송
-    processed_count = await _send_to_kafka(payloads)
+    processed_count, failed_ids = await _send_to_kafka(payloads)
 
     # 응답 상태 코드 결정 (일부만 성공했을 때 207 반환)
     if processed_count < len(data_list):
@@ -231,7 +234,8 @@ async def ingest_telemetry_batch(data_list: List[ConnectedCarData], response: Re
     return {
         "status": "success" if processed_count == len(data_list) else "partial",
         "processed_count": processed_count,
-        "failed_count" : len(data_list) - processed_count,
+        "failed_count" : len(failed_ids),
+        "failed_vehicle_ids": failed_ids,
         "vehicle_ids": vehicle_ids[:10] if len(vehicle_ids) > 10 else vehicle_ids,
         "kafka_enabled": KAFKA_ENABLED,
     }

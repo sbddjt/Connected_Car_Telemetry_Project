@@ -61,6 +61,10 @@ MAX_ACCEL_KMH_PER_SEC = 8.0
 MAX_DECEL_KMH_PER_SEC = 25.0
 INGEST_INTERVAL_MIN = float(os.getenv("INGEST_INTERVAL_MIN", "5.0"))
 INGEST_INTERVAL_MAX = float(os.getenv("INGEST_INTERVAL_MAX", "10.0"))
+
+assert INGEST_INTERVAL_MIN <= INGEST_INTERVAL_MAX, (
+    f"INGEST_INTERVAL_MIN({INGEST_INTERVAL_MIN}) > INGEST_INTERVAL_MAX({INGEST_INTERVAL_MAX})"
+)
 INGEST_REQUEST_TIMEOUT = float(os.getenv("INGEST_REQUEST_TIMEOUT", "10.0"))
 MAX_SEED_JITTER_DEG = 0.002
 EARTH_RADIUS_KM = 6371.0088
@@ -481,7 +485,7 @@ async def generate_telemetry(vehicle_id: str) -> None:
         
         now = datetime.now(timezone.utc)
         dt = (now - vehicle.last_updated).total_seconds()
-        dt = max(1.0, min(3.5, dt))
+        dt = max(1.0, min(10.0, dt))
         vehicle.last_updated = now
 
         simulate_trip_state(vehicle, dt)
@@ -529,15 +533,28 @@ async def transmit_telemetry(vehicle_id: str) -> None:
             bulk_data = list(vehicle.tx_buffer)[:batch_size]
             error_msg = None
 
-            try:
+            valid_data = []
+            for item in bulk_data:
+                try:
+                    VehicleEnvelope(**item)
+                    valid_data.append(item)
+                except Exception as e:
+                    print(f"⚠ {vehicle_id} 스키마 검증 실패, 데이터 드랍: {e}")
+            
+            if not valid_data:
+                for _ in range(batch_size):
+                    vehicle.tx_buffer.popleft()
+                continue
+
+            try:    
                 response = await client.post(
                     EXTERNAL_BATCH_URL,
-                    json=bulk_data,
+                    json=valid_data,
                     timeout=INGEST_REQUEST_TIMEOUT
                 )
 
                 if response.status_code in (200, 207):
-                    for _ in range(batch_size):
+                    for _ in range(len(valid_data)):
                         vehicle.tx_buffer.popleft()
                     vehicle.retry_count = 0
                     vehicle.last_retry_time = None
