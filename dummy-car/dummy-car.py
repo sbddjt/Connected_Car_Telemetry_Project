@@ -200,13 +200,12 @@ class VehicleState:
 
 
 class VehicleEnvelope(BaseModel):
-    vehicle_id: str = Field(..., example="CAR-1001")
-    vin: str = Field(..., example="KICF9AA1001000001")
-    model: str = Field(..., example="Hyundai IONIQ 5")
-    driver: str = Field(..., example="김도윤")
-    timestamp: str
+    vehicle: Dict[str, Any] = Field(..., description="차량 기본 정보 (vehicle_id, vin 등)")
     location: Dict[str, Any]
-    telemetry: Dict[str, Any]
+    trip: Dict[str, Any]
+    battery: Dict[str, Any]
+    temperatures_c: Dict[str, Any]
+    dynamics: Dict[str, Any]
     status: Dict[str, Any]
     diagnostics: Dict[str, Any]
     events: List[str]
@@ -515,7 +514,10 @@ async def transmit_telemetry(vehicle_id: str) -> None:
     # 전송 전용 - 백오프 적용
     vehicle = vehicle_states[vehicle_id]
 
-    async with httpx.AsyncClient() as client:
+    # httpx 커넥션 풀 Limits 설정 추가
+    limits = httpx.Limits(max_keepalive_connections = 5, max_connections = 10)
+
+    async with httpx.AsyncClient(limits = limits) as client:
         while True:
             # 버퍼 빌 때까지 잠깐 대기
             if len(vehicle.tx_buffer) == 0:
@@ -547,7 +549,7 @@ async def transmit_telemetry(vehicle_id: str) -> None:
                     timeout=INGEST_REQUEST_TIMEOUT
                 )
 
-                if response.status_code == 200:
+                if response.status_code in (200, 207):
                     for _ in range(batch_size):
                         vehicle.tx_buffer.popleft()
                     vehicle.retry_count = 0

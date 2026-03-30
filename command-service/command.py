@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from aiokafka import AIOKafkaProducer
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import logging
@@ -206,7 +206,7 @@ async def _send_to_kafka(data_list: List[Dict[str, Any]]) -> int:
     return success_count
 
 @app.post("/api/telemetry/batch")
-async def ingest_telemetry_batch(data_list: List[ConnectedCarData]):
+async def ingest_telemetry_batch(data_list: List[ConnectedCarData], response: Response):
     # 배치 텔레메트리 수신 (단일 데이터도 리스트로 받음)
 
     if not data_list:
@@ -217,6 +217,10 @@ async def ingest_telemetry_batch(data_list: List[ConnectedCarData]):
 
     # Kafka로 전송
     processed_count = await _send_to_kafka(payloads)
+
+    # 응답 상태 코드 결정 (일부만 성공했을 때 207 반환)
+    if processed_count < len(data_list):
+        response.status_code = status.HTTP_207_MULTI_STATUS
 
     # 응답
     vehicle_ids = [p["vehicle"]["vehicle_id"] for p in payloads]
@@ -230,11 +234,11 @@ async def ingest_telemetry_batch(data_list: List[ConnectedCarData]):
     }
 
 @app.post("/api/telemetry")
-async def ingest_telemetry_single(data: ConnectedCarData):
+async def ingest_telemetry_single(data: ConnectedCarData, response: Response):
     # 단일 텔레메트리 수신 (하위 호환성용)
     # 내부적으론 배치 엔드포인트 호출
 
-    result = await ingest_telemetry_batch([data])
+    result = await ingest_telemetry_batch([data], response)
 
     return {
         "status" : "success",
