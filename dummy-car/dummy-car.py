@@ -554,7 +554,7 @@ async def transmit_telemetry(vehicle_id: str) -> None:
                 )
 
                 if response.status_code in (200, 207):
-                    for _ in range(len(valid_data)):
+                    for _ in range(batch_size):
                         vehicle.tx_buffer.popleft()
                     vehicle.retry_count = 0
                     vehicle.last_retry_time = None
