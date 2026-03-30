@@ -143,23 +143,10 @@ class ConnectedCarData(BaseModel):
 def _build_kafka_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     # 원본 데이터를 Kafka 메시지 포맷으로 변환
     vehicle = payload["vehicle"]
-    location = payload["location"]["coordinates"]
-    trip = payload["trip"]
-    battery = payload["battery"]
-    events = payload.get("events", [])
 
     return {
         "vehicle_id": vehicle["vehicle_id"],
-        "timestamp": vehicle["timestamp"],
         "received_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "state": trip.get("state"),
-        "speed_kmh": trip.get("speed_kmh"),
-        "soc_pct": battery.get("soc_pct"),
-        "location": {
-            "latitude": location.get("latitude"),
-            "longitude": location.get("longitude"),
-        },
-        "recent_event": events[-1] if events else None,
         "raw": payload,
     }
 
