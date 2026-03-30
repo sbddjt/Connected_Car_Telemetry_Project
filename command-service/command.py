@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import logging
+import socket
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -29,42 +31,42 @@ KAFKA_CLIENT_ID = _get_env("KAFKA_CLIENT_ID", "command-api-producer")
 KAFKA_ENABLED = _as_bool("KAFKA_ENABLED", False) # 로컬 테스트용으로 False
 ENABLE_SCHEMA_LOG = _as_bool("ENABLE_SCHEMA_LOG", False)
 
-app = FastAPI(title=APP_NAME)
-
 # 전역 비동기 카프카 프로듀서
 producer: Optional[AIOKafkaProducer] = None
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 서버 켜질 때 
     global producer
     if KAFKA_ENABLED:
         try:
+            unique_client_id = f"{KAFKA_CLIENT_ID}-{socket.gethostname()}"
+
             producer = AIOKafkaProducer(
                 bootstrap_servers = [s.strip() for s in KAFKA_BROKERS.split(",") if s.strip()],
                 value_serializer = lambda v : json.dumps(v).encode("utf-8"),
                 key_serializer = lambda v : v.encode("utf-8") if isinstance(v, str) else None,
                 acks = "all",
-                client_id = KAFKA_CLIENT_ID,
-                compression_type = "gzip" # 압축 추가
+                client_id = unique_client_id,
+                compression_type = "gzip"
             )
-
-            await producer.start() # 비동기로 연결 시작
-            print(f"[AIOKafkaProducer] started: brokers = {KAFKA_BROKERS}")
+            await producer.start()
+            logger.info(f"[AIOKafkaProducer] started: brokers = {KAFKA_BROKERS}, client_id = {unique_client_id}")
         
         except Exception as exc:
-            print(f"[AIOKafkaProducer] init failed : {exc}")
+            logger.error(f"[AIOKafkaProducer] init failed : {exc}")
             producer = None
-    
     else:
         logger.info(" Kafka disabled - running in local test mode")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    global producer
+    yield
+
+    # 서버 꺼질 때
     if producer:
         await producer.stop()
         logger.info("AIOKafkaProducer stopped")
 
+app = FastAPI(title = APP_NAME, lifespan = lifespan)
 
 class VehicleInfo(BaseModel):
     vehicle_id: str

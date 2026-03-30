@@ -15,15 +15,33 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
 # 서울 위도/경도 최소/최대
 SEOUL_BOUNDS = (37.40, 37.70, 126.76, 127.20)
 SEOUL_ANCHOR = ("Seoul", 37.5665, 126.9780, 55.0)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 서버 켜질 때
+    print("Connected Car Dummy Stream starting...")
+    for vehicle_id in vehicle_states:
+        producer_tasks.append(asyncio.create_task(generate_telemetry(vehicle_id)))
+        producer_tasks.append(asyncio.create_task(transmit_telemetry(vehicle_id)))
+
+    yield
+
+    # 서버 꺼질 때 
+    print("Shutting down Dummy Stream...")
+    for task in producer_tasks:
+        task.cancel()
+    await asyncio.gather(*producer_tasks, return_exceptions=True)
+
 app = FastAPI(
-    title="Connected Car Dummy Stream Server",
-    version="0.1.0",
-    description="Connected car dummy data producer for local simulation and API demo",
+    title = "Connected Car Dummy Stream Server",
+    version = "0.1.0",
+    description = "Connected car dummy data producer for local simulation and API demo",
+    lifespan = lifespan
 )
 
 app.add_middleware(
@@ -625,16 +643,3 @@ def status():
         },
         "now": utc_now_iso(),
     }
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    print("Connected Car Dummy Stream starting...")
-    for vehicle_id in vehicle_states:
-        producer_tasks.append(asyncio.create_task(generate_telemetry(vehicle_id)))
-        producer_tasks.append(asyncio.create_task(transmit_telemetry(vehicle_id)))
-
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    for task in producer_tasks:
-        task.cancel()
-    await asyncio.gather(*producer_tasks, return_exceptions=True)
